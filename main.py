@@ -22,6 +22,10 @@ TARGET_GAIN_PCT    = float(os.getenv("TARGET_GAIN_PCT", "5.0"))  # e.g., 5.0 = 5
 SLEEP_BETWEEN_ORDERS_SEC = float(os.getenv("SLEEP_BETWEEN_ORDERS_SEC", "0.5"))
 EXTENDED_HOURS = os.getenv("EXTENDED_HOURS", "false").lower() in ("1", "true", "yes")
 
+# Sheet layout anchors
+LOG_HEADERS     = ["Timestamp","Action","Symbol","NotionalUSD","Qty","OrderID","Status","Note"]
+LOG_TABLE_RANGE = "A1:H1"
+
 
 # =========================
 # Helpers
@@ -46,17 +50,44 @@ def _get_ws(gc, sheet_name, tab):
         return sh.add_worksheet(title=tab, rows="2000", cols="50")
 
 
+def ensure_log(ws):
+    """Ensure header is exactly in A1:H1 and frozen; prevents offset drift."""
+    vals = ws.get_values("A1:H1")
+    if not vals or vals[0] != LOG_HEADERS:
+        ws.update("A1:H1", [LOG_HEADERS])
+    try:
+        ws.freeze(rows=1)
+    except Exception:
+        pass
+
+
 def append_logs(ws, rows):
     """
-    rows: List[List[Any]] to append to LOG_TAB.
+    Append logs anchored to A1:H1, forcing exactly 8 columns per row.
+    This avoids Sheets creating a separate 'table' off to the right.
     """
     if not rows:
         return
-    existing = ws.get_all_values()
-    if not existing:
-        ws.append_row(["Timestamp", "Action", "Symbol", "NotionalUSD", "Qty", "OrderID", "Status", "Note"])
-    for i in range(0, len(rows), 100):
-        ws.append_rows(rows[i:i+100], value_input_option="USER_ENTERED")
+    fixed = []
+    for r in rows:
+        if len(r) < 8:
+            r = r + [""] * (8 - len(r))
+        elif len(r) > 8:
+            r = r[:8]
+        fixed.append(r)
+    try:
+        # Anchor appends to our table
+        for i in range(0, len(fixed), 100):
+            ws.append_rows(
+                fixed[i:i+100],
+                value_input_option="RAW",     # avoid locale/date auto-parsing
+                table_range=LOG_TABLE_RANGE   # <<< anchor prevents offset
+            )
+    except TypeError:
+        # Fallback for older gspread without table_range support
+        start_row = len(ws.get_all_values()) + 1
+        end_row = start_row + len(fixed) - 1
+        ws.update(f"A{start_row}:H{end_row}", fixed, value_input_option="RAW")
 
 
 def make_alpaca():
@@ -75,7 +106,9 @@ def sell_all(api: REST, symbol: str, qty_str: str, extended: bool):
     """
     Market sell for the full quantity in the position.
     qty_str should be the position.qty string from Alpaca (works for fractional).
+    Adds an idempotent client_order_id so retries won't double-sell.
     """
+    client_order_id = f"sell-{symbol}-{int(time.time()*1000)}"
     order = api.submit_order(
         symbol=symbol,
         side="sell",
@@ -83,6 +116,7 @@ def sell_all(api: REST, symbol: str, qty_str: str, extended: bool):
         time_in_force="day",
         qty=qty_str,
         extended_hours=extended,
+        client_order_id=client_order_id,
     )
     return order
 
@@ -95,7 +129,7 @@ def main():
 
     gc = get_google_client()
     api = make_alpaca()
-    log_ws = _get_ws(gc, SHEET_NAME, LOG_TAB)
+    log_ws = _get_ws(gc, SHEET_NAME, LOG_TAB); ensure_log(log_ws)
 
     target = TARGET_GAIN_PCT / 100.0
     logs = []
@@ -126,7 +160,6 @@ def main():
                 cost_basis = float(pos.cost_basis)
                 market_value = float(pos.market_value)
             except Exception:
-                # Fallback via avg_entry_price * qty *last? But Alpaca provides both; if missing, skip safely.
                 note = "Missing/invalid cost_basis or market_value"
                 print(f"⚠️ {symbol} {note}")
                 logs.append([now_iso_utc(), "SELL-SKIP", symbol, "", qty_str, "", "SKIPPED", note])
