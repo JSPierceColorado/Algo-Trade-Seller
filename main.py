@@ -31,21 +31,22 @@ ALPACA_BASE_URL = (
     or os.getenv("APCA_API_BASE_URL")
     or "https://paper-api.alpaca.markets"
 )
-ALPACA_DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets")
+ALPACA_DATA_URL   = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets")
+ALPACA_DATA_FEED  = os.getenv("ALPACA_DATA_FEED", "iex")  # "iex" for free plans; "sip" if you have it
 
 DRY_RUN               = os.getenv("DRY_RUN", "1").lower() in ("1","true","yes")
 
 # Google Sheets logging
 USE_SHEETS_LOG        = os.getenv("USE_SHEETS_LOG", "1").lower() in ("1","true","yes")
 SHEET_NAME            = os.getenv("SHEET_NAME", "Trading Log")
-LOG_TAB               = os.getenv("STOCK_LOG_TAB", "log")  # must have headers: Timestamp | Action | Symbol | NotionalUSD | Qty | OrderID | Status | Note
+LOG_TAB               = os.getenv("STOCK_LOG_TAB", "log")  # headers: Timestamp | Action | Symbol | NotionalUSD | Qty | OrderID | Status | Note
 
 # Verbosity (console)
 VERBOSE               = os.getenv("VERBOSE", "1").lower() in ("1","true","yes")
 
 # Strategy params
 RSI_WINDOW            = int(os.getenv("RSI_WINDOW", "14"))
-RSI_OVERBOUGHT        = int(os.getenv("RSI_OVERBOUGHT", "70"))     # RSI threshold for "overbought"
+RSI_OVERBOUGHT        = int(os.getenv("RSI_OVERBOUGHT", "70"))       # RSI threshold for "overbought"
 TAKE_PROFIT_OB_PCT    = float(os.getenv("TAKE_PROFIT_OVERBOUGHT_PCT", "5"))   # profit% if RSI overbought
 TAKE_PROFIT_PCT       = float(os.getenv("TAKE_PROFIT_PCT", "10"))             # unconditional take-profit %
 
@@ -95,71 +96,106 @@ def fetch_alpaca_positions() -> List[Dict[str, Any]]:
     return out
 
 # ========================================
-# Market data (Alpaca Data API)
+# Market data (Alpaca Data API) — robust with feed + pagination + start date
 def fetch_history(ticker: str, max_days: int = 450) -> pd.DataFrame:
     """
-    Fetch daily bars from Alpaca. Returns DataFrame with index=datetime and
-    columns: Open, High, Low, Close, Volume.
+    Robust: uses Alpaca v2 bars with explicit feed (env), start date (~800d), and pagination.
+    Returns DataFrame with Date index and columns: Open, High, Low, Close, Volume.
     """
     if not (ALPACA_KEY and ALPACA_SECRET):
         raise RuntimeError("Alpaca credentials missing (ALPACA_KEY_ID / ALPACA_SECRET_KEY)")
 
-    limit = min(max_days + 20, 10000)
+    base_url = f"{ALPACA_DATA_URL}/v2/stocks/{ticker}/bars"
 
-    url = f"{ALPACA_DATA_URL}/v2/stocks/{ticker}/bars"
-    params = {
-        "timeframe": "1Day",
-        "limit": str(limit),
-        "adjustment": "raw",   # or "all" if you want splits/divs adjusted
-        # "feed": "sip",       # optional if you have SIP; omit if not
-    }
-    headers = {
-        "APCA-API-KEY-ID": ALPACA_KEY,
-        "APCA-API-SECRET-KEY": ALPACA_SECRET,
-    }
+    def _get_bars(feed: str) -> pd.DataFrame:
+        start_dt = (datetime.utcnow() - pd.Timedelta(days=800)).strftime("%Y-%m-%dT00:00:00Z")
+        params = {
+            "timeframe": "1Day",
+            "start": start_dt,
+            "adjustment": "raw",   # or "all"
+            "limit": "10000",
+            "feed": feed,
+        }
+        headers = {
+            "APCA-API-KEY-ID": ALPACA_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_SECRET,
+        }
 
-    try:
-        r = requests.get(url, headers=headers, params=params, timeout=20)
-        if r.status_code >= 300:
-            vlog_print(f"⚠️ Bars API {ticker} HTTP {r.status_code}: {r.text[:120]}")
+        all_bars = []
+        page_token = None
+        while True:
+            if page_token:
+                params["page_token"] = page_token
+            try:
+                r = requests.get(base_url, headers=headers, params=params, timeout=20)
+            except Exception as e:
+                vlog_print(f"⚠️ {ticker} {feed} request error: {e}")
+                break
+            if r.status_code >= 300:
+                vlog_print(f"⚠️ {ticker} {feed} HTTP {r.status_code}: {r.text[:120]}")
+                break
+            j = r.json() or {}
+            bars = j.get("bars", [])
+            if not bars:
+                break
+            all_bars.extend(bars)
+            page_token = j.get("next_page_token")
+            if not page_token or len(all_bars) >= max_days + 50:
+                break
+            time.sleep(0.1)
+
+        if not all_bars:
             return pd.DataFrame()
-        j = r.json() or {}
-        bars = j.get("bars", [])
-        if not bars:
-            vlog_print(f"⚠️ No daily bars returned for {ticker}")
-            return pd.DataFrame()
 
-        df = pd.DataFrame(bars)
-        # 't' is RFC3339 timestamp
+        df = pd.DataFrame(all_bars)
         df["t"] = pd.to_datetime(df["t"], utc=True).dt.tz_convert(None)
-        df = df.rename(columns={
-            "t": "Date", "o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"
-        }).set_index("Date")
-        cols = ["Open", "High", "Low", "Close", "Volume"]
-        df = df[cols].sort_index().dropna().tail(max_days).copy()
-        return df
-    except Exception as e:
-        vlog_print(f"⚠️ Exception fetching {ticker} bars: {e}")
-        return pd.DataFrame()
+        df = df.rename(columns={"t": "Date", "o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
+        df = df.set_index("Date").sort_index()
+        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+        return df.tail(max_days).copy()
+
+    # Try preferred feed first, then fallback to SIP
+    df = _get_bars(ALPACA_DATA_FEED)
+    if df.empty and ALPACA_DATA_FEED != "sip":
+        vlog_print(f"ℹ️ {ticker}: retrying with SIP feed fallback")
+        df = _get_bars("sip")
+
+    if df.empty:
+        vlog_print(f"⚠️ No bars for {ticker} even after feed fallback")
+    else:
+        vlog_print(f"✅ {ticker}: {len(df)} daily bars fetched (last close ${float(df['Close'].iloc[-1]):.2f})")
+
+    return df
 
 # ========================================
-# Indicators
+# Indicators — hardened RSI (no NaNs)
 def rsi(s: pd.Series, w: int = 14) -> pd.Series:
+    if len(s) < 2:
+        return pd.Series([50.0]*len(s), index=s.index)  # neutral if not enough data
     d = s.diff()
     up = d.clip(lower=0)
     down = -d.clip(upper=0)
+
     gain = up.ewm(alpha=1/w, adjust=False).mean()
-    loss = down.ewm(alpha=1/w, adjust=False).mean().replace(0, np.nan)
-    rs = gain / loss
-    return 100 - (100/(1+rs))
+    loss = down.ewm(alpha=1/w, adjust=False).mean()
+
+    # RS with zero-protection
+    rs = pd.Series(np.divide(gain, loss.replace(0, np.nan)), index=s.index)
+    rsi_raw = 100 - (100 / (1 + rs))
+
+    # Deterministic fills for edge cases
+    rsi_filled = rsi_raw.copy()
+    rsi_filled[(loss == 0) & (gain > 0)] = 100.0   # only gains
+    rsi_filled[(gain == 0) & (loss > 0)] = 0.0     # only losses
+    rsi_filled = rsi_filled.fillna(50.0)           # flat/warm-up
+    return rsi_filled
 
 # ========================================
-# Decision engine (YOUR NEW RULES)
+# Decision engine (YOUR RULES)
 def decide_sell(ticker: str, qty: float, avg_cost: float, df: pd.DataFrame,
                 entry_dt: Optional[pd.Timestamp]) -> Tuple[str, List[str], float]:
     """
     Returns (decision, reasons, last_price)
-    New rules:
       - SELL if RSI >= RSI_OVERBOUGHT AND profit >= TAKE_PROFIT_OB_PCT
       - SELL if profit >= TAKE_PROFIT_PCT
       - else HOLD
@@ -177,13 +213,15 @@ def decide_sell(ticker: str, qty: float, avg_cost: float, df: pd.DataFrame,
         profit_pct = 0.0
 
     rsi_series = rsi(close, RSI_WINDOW)
-    rsi_now = float(rsi_series.iloc[-1]) if not rsi_series.isna().iloc[-1] else float("nan")
+    rsi_now = float(rsi_series.iloc[-1]) if len(rsi_series) else 50.0
+    if np.isnan(rsi_now):
+        rsi_now = 50.0  # neutral fallback
 
     reasons: List[str] = []
     decision = "HOLD"
 
     # Rule 1: RSI overbought AND profit >= TAKE_PROFIT_OB_PCT
-    if not np.isnan(rsi_now) and rsi_now >= RSI_OVERBOUGHT and profit_pct >= TAKE_PROFIT_OB_PCT:
+    if rsi_now >= RSI_OVERBOUGHT and profit_pct >= TAKE_PROFIT_OB_PCT:
         decision = "SELL"
         reasons.append(f"rsi_overbought_and_profit(RSI≥{RSI_OVERBOUGHT}, profit≥{TAKE_PROFIT_OB_PCT:.1f}%, now={profit_pct:.2f}%)")
 
@@ -249,8 +287,7 @@ try:
         end = chr(ord('A') + len(headers) - 1) + "1"
         vals = ws.get_values(f"A1:{end}")
         if not vals or vals[0] != headers:
-            # Pass values first, then range_name (avoid deprecation warning)
-            ws.update([headers], f"A1:{end}")
+            ws.update([headers], f"A1:{end}")  # values first, then range_name
         try:
             ws.freeze(rows=1)
         except Exception:
@@ -271,7 +308,7 @@ except Exception:
 # Main
 def main():
     print("🏁 stock-seller (portfolio-native) starting")
-    print(f"ENV: BROKER={BROKER} DRY_RUN={DRY_RUN} BASE_URL={ALPACA_BASE_URL}")
+    print(f"ENV: BROKER={BROKER} DRY_RUN={DRY_RUN} BASE_URL={ALPACA_BASE_URL} FEED={ALPACA_DATA_FEED}")
 
     # 1) Fetch live positions from broker
     if BROKER != "ALPACA":
@@ -329,7 +366,7 @@ def main():
             vlog("STOCK-SELL-HOLD", tkr, notional, qty, "", "HOLD", notes)
             hold_count += 1
 
-        time.sleep(0.2)  # polite throttle
+        time.sleep(0.15)  # polite throttle
 
     # 4) Write logs (optional)
     if ws_log is not None and log_rows:
