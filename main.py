@@ -1,4 +1,4 @@
-import os, json, time
+import os, json, time, math, warnings
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -9,10 +9,6 @@ import numpy as np
 # ============= Config (env) =============
 # Broker / execution
 BROKER = os.getenv("BROKER", "ALPACA").upper()   # "ALPACA" (supported) or ""
-
-# Verbosity / observability
-VERBOSE = os.getenv("VERBOSE", "1").lower() in ("1","true","yes","on")
-PRINT_SUMMARY = os.getenv("PRINT_SUMMARY", "1").lower() in ("1","true","yes","on")
 
 # Accept several common env var names for Alpaca keys (more deploy-proof)
 ALPACA_KEY = (
@@ -44,8 +40,11 @@ MIN_NOTIONAL_USD      = float(os.getenv("MIN_NOTIONAL_USD", "25"))
 # Optional: Google Sheets logging (positions are NOT read from Sheets)
 USE_SHEETS_LOG        = os.getenv("USE_SHEETS_LOG", "1").lower() in ("1","true","yes")
 SHEET_NAME            = os.getenv("SHEET_NAME", "Trading Log")
-SIGNALS_TAB           = os.getenv("STOCK_SIGNALS_TAB", "stocks_sell_signals")
-LOG_TAB               = os.getenv("STOCK_LOG_TAB", "stocks_log")
+SIGNALS_TAB           = os.getenv("STOCK_SIGNALS_TAB", "stocks_sell_signals")  # kept for compatibility
+LOG_TAB               = os.getenv("STOCK_LOG_TAB", "log")  # your tab has headers: Timestamp ... Note
+
+# Verbosity (console)
+VERBOSE               = os.getenv("VERBOSE", "1").lower() in ("1","true","yes")
 
 # Exit criteria toggles
 USE_TREND_BREAK       = os.getenv("USE_TREND_BREAK", "1").lower() in ("1","true","yes")
@@ -70,17 +69,15 @@ UNDERPERF_SPY_PCT     = float(os.getenv("UNDERPERF_SPY_PCT", "8"))  # vs SPY ove
 
 # ========================================
 # Utility
-
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def log(msg: str):
+def vlog_print(msg: str):
     if VERBOSE:
-        print(f"[{now_iso()}] {msg}")
+        print(msg)
 
 # ========================================
 # Positions (Portfolio-native from Alpaca)
-
 def fetch_alpaca_positions() -> List[Dict[str, Any]]:
     """
     Returns list of long equity positions:
@@ -104,7 +101,7 @@ def fetch_alpaca_positions() -> List[Dict[str, Any]]:
         try:
             if str(p.get("side","")).lower() != "long":
                 continue
-            if p.get("asset_class","{}").lower() not in ("us_equity", "us_equity/etp", "us_equity/adr"):
+            if p.get("asset_class","").lower() not in ("us_equity", "us_equity/etp", "us_equity/adr"):
                 continue
             symbol = (p.get("symbol") or "").upper()
             qty = float(p.get("qty", "0") or 0)
@@ -117,7 +114,6 @@ def fetch_alpaca_positions() -> List[Dict[str, Any]]:
 
 # ========================================
 # Market data (Alpaca Data API)
-
 def fetch_history(ticker: str, max_days: int = 450) -> pd.DataFrame:
     """
     Fetch daily bars from Alpaca. Returns DataFrame with index=datetime and
@@ -132,8 +128,8 @@ def fetch_history(ticker: str, max_days: int = 450) -> pd.DataFrame:
     params = {
         "timeframe": "1Day",
         "limit": str(limit),
-        "adjustment": "raw",  # or "all" if you want splits/divs adjusted
-        # "feed": "sip",      # optional if you have SIP; omit if not
+        "adjustment": "raw",   # or "all" if you want splits/divs adjusted
+        # "feed": "sip",       # optional if you have SIP; omit if not
     }
     headers = {
         "APCA-API-KEY-ID": ALPACA_KEY,
@@ -143,10 +139,12 @@ def fetch_history(ticker: str, max_days: int = 450) -> pd.DataFrame:
     try:
         r = requests.get(url, headers=headers, params=params, timeout=20)
         if r.status_code >= 300:
+            vlog_print(f"⚠️ Bars API {ticker} HTTP {r.status_code}: {r.text[:120]}")
             return pd.DataFrame()
         j = r.json() or {}
         bars = j.get("bars", [])
         if not bars:
+            vlog_print(f"⚠️ No daily bars returned for {ticker}")
             return pd.DataFrame()
 
         df = pd.DataFrame(bars)
@@ -158,9 +156,9 @@ def fetch_history(ticker: str, max_days: int = 450) -> pd.DataFrame:
         cols = ["Open", "High", "Low", "Close", "Volume"]
         df = df[cols].sort_index().dropna().tail(max_days).copy()
         return df
-    except Exception:
+    except Exception as e:
+        vlog_print(f"⚠️ Exception fetching {ticker} bars: {e}")
         return pd.DataFrame()
-
 
 def fetch_next_earnings_days(ticker: str) -> Optional[pd.Timestamp]:
     """Stub: implement via Polygon/other if USE_EARNINGS_EXIT is enabled."""
@@ -168,18 +166,14 @@ def fetch_next_earnings_days(ticker: str) -> Optional[pd.Timestamp]:
 
 # ========================================
 # Indicators
-
 def sma(s: pd.Series, w: int) -> pd.Series: return s.rolling(w).mean()
-
 def ema(s: pd.Series, w: int) -> pd.Series: return s.ewm(span=w, adjust=False).mean()
-
 
 def atr(df: pd.DataFrame, w: int) -> pd.Series:
     h, l, c = df["High"], df["Low"], df["Close"]
     prev_c = c.shift(1)
     tr = pd.concat([(h-l).abs(), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
     return tr.rolling(window=w, min_periods=w).mean()
-
 
 def rsi(s: pd.Series, w: int = 14) -> pd.Series:
     d = s.diff()
@@ -190,7 +184,6 @@ def rsi(s: pd.Series, w: int = 14) -> pd.Series:
     rs = gain / loss
     return 100 - (100/(1+rs))
 
-
 def macd(s: pd.Series, fast=12, slow=26, signal=9):
     ef = ema(s, fast); es = ema(s, slow)
     line = ef - es; sig = ema(line, signal)
@@ -199,7 +192,6 @@ def macd(s: pd.Series, fast=12, slow=26, signal=9):
 
 # ========================================
 # Decision engine
-
 def decide_sell(ticker: str, qty: float, avg_cost: float, df: pd.DataFrame,
                 entry_dt: Optional[pd.Timestamp]) -> Tuple[str, List[str], float]:
     """
@@ -284,7 +276,6 @@ def decide_sell(ticker: str, qty: float, avg_cost: float, df: pd.DataFrame,
 
 # ========================================
 # Optional order placement (Alpaca)
-
 def alpaca_sell_market(ticker: str, qty: float) -> Tuple[str, str]:
     """
     Returns (order_id, status). DRY_RUN is handled by caller.
@@ -333,15 +324,18 @@ try:
             end = chr(ord('A') + len(headers) - 1) + "1"
             vals = ws.get_values(f"A1:{end}")
             if not vals or vals[0] != headers:
+                # Fix deprecation: pass values first, then range_name
                 ws.update([headers], f"A1:{end}")
             try: ws.freeze(rows=1)
             except Exception: pass
             return ws
 
         signals_headers = ["Timestamp","Ticker","Decision","Qty","Last","Notional","Reasons","Notes"]
-        log_headers     = ["Timestamp","Action","Ticker","ProceedsUSD","Qty","OrderID","Status","Note"]
+        # Your existing LOG tab headers (do not change order or names)
+        log_headers     = ["Timestamp","Action","Symbol","NotionalUSD","Qty","OrderID","Status","Note"]
 
-        ws_sig = _ensure(SIGNALS_TAB, signals_headers, clear_first=True)
+        # We won't clear either tab on each run
+        ws_sig = _ensure(SIGNALS_TAB, signals_headers, clear_first=False)
         ws_log = _ensure(LOG_TAB,     log_headers,     clear_first=False)
         return ws_sig, ws_log
 
@@ -356,27 +350,20 @@ except Exception:
     def append_rows(ws, rows): return
 
 # ========================================
-# Pretty printing helpers
-
-def _fmt_row(cols: list, widths: list) -> str:
-    return " ".join(str(c).ljust(w) for c, w in zip(cols, widths))
-
-# ========================================
 # Main
-
 def main():
     print("🏁 stock-seller (portfolio-native) starting")
-    log(f"ENV: BROKER={BROKER} DRY_RUN={DRY_RUN} VERBOSE={VERBOSE} BASE_URL={ALPACA_BASE_URL}")
+    print(f"ENV: BROKER={BROKER} DRY_RUN={DRY_RUN} BASE_URL={ALPACA_BASE_URL}")
 
     # 1) Fetch live positions from broker
     if BROKER != "ALPACA":
         raise RuntimeError("Only BROKER=ALPACA is supported in this portfolio-native version right now.")
     positions = fetch_alpaca_positions()
     if not positions:
-        print("ℹ️ No long equity positions from Alpaca.")
+        print("ℹ️ No long US equity positions from Alpaca. Nothing to do.")
         return
 
-    log(f"Found {len(positions)} positions: " + ", ".join(f"{p['ticker']}({p['qty']})" for p in positions))
+    print(f"📈 Found {len(positions)} long position(s) to evaluate")
 
     # 2) Optionally set up logging tabs (signals/log). Positions are not read from Sheets.
     ws_sig = ws_log = None
@@ -384,19 +371,24 @@ def main():
         try:
             gc = get_gc()
             ws_sig, ws_log = ensure_tabs(gc)
-            log(f"Sheets logging enabled → Spreadsheet='{SHEET_NAME}', tabs=['{SIGNALS_TAB}','{LOG_TAB}']")
         except Exception as e:
             print(f"⚠️ Sheets logging disabled: {e}")
 
-    signals_rows: List[List[Any]] = []
-    log_rows: List[List[Any]] = []
+    signals_rows: List[List[Any]] = []  # optional signals tab (kept for compatibility)
+    log_rows: List[List[Any]] = []      # will mirror console decisions into your LOG tab
 
-    # console table header
-    if PRINT_SUMMARY:
-        widths = [20, 8, 8, 10, 10, 40]
-        header = _fmt_row(["Timestamp", "Ticker", "Dec", "Qty", "Last", "Reasons"], widths)
-        print(header)
-        print("-" * len(header))
+    # Helper to add a row in LOG format + console message
+    def vlog(action: str, symbol: str, notional: float, qty: float, order_id: str, status: str, note: str):
+        ts = now_iso()
+        msg = f"[{symbol}] {action} qty={qty:.4f} notional=${notional:.2f} status={status} note={note}"
+        vlog_print(msg)
+        log_rows.append([
+            ts, action, symbol, f"{notional:.2f}", f"{qty:.4f}", order_id, status, note
+        ])
+
+    sell_count = 0
+    hold_count = 0
+    dryrun_proceeds = 0.0
 
     for pos in positions:
         tkr = pos["ticker"]
@@ -407,31 +399,31 @@ def main():
         decision, reasons, last = decide_sell(tkr, qty, avg, df, pos.get("entry_dt"))
 
         notional = last * qty if last > 0 else 0.0
-        notes = f"avg ${avg:.2f}"
-        stamp = now_iso()
-        signals_rows.append([stamp, tkr, decision, f"{qty:.4f}", f"{last:.2f}", f"{notional:.2f}", ", ".join(reasons), notes])
+        notes = "; ".join(reasons)
 
-        if PRINT_SUMMARY:
-            print(_fmt_row([stamp, tkr, decision, f"{qty:.4f}", f"{last:.2f}", ", ".join(reasons)], [20, 8, 8, 10, 10, 40]))
+        # Optional signals (separate tab; keep but don't clear the tab)
+        signals_rows.append([now_iso(), tkr, decision, f"{qty:.4f}", f"{last:.2f}", f"{notional:.2f}", ", ".join(reasons), f"avg ${avg:.2f}"])
 
         if decision == "SELL" and notional >= MIN_NOTIONAL_USD:
             if DRY_RUN:
                 order_id, status = "DRYRUN", "dry-run"
             else:
                 order_id, status = alpaca_sell_market(tkr, qty)
-            log_rows.append([stamp, "STOCK-SELL", tkr, f"{notional:.2f}", f"{qty:.4f}", order_id, status, "; ".join(reasons)])
-            log(f"Action: SELL {tkr} x {qty} → {status} (order={order_id}) | notional=${notional:.2f}")
+            vlog("STOCK-SELL", tkr, notional, qty, order_id, status, notes)
+            sell_count += 1
+            dryrun_proceeds += notional
         else:
-            log_rows.append([stamp, "STOCK-SELL-HOLD", tkr, f"{notional:.2f}", f"{qty:.4f}", "", "HOLD", "; ".join(reasons)])
-            log(f"Hold: {tkr} (notional=${notional:.2f}) reasons={', '.join(reasons)}")
+            vlog("STOCK-SELL-HOLD", tkr, notional, qty, "", "HOLD", notes)
+            hold_count += 1
 
         time.sleep(0.2)  # polite throttle
 
     # 3) Write logs (optional)
-    if ws_sig is not None:
+    if ws_sig is not None and signals_rows:
         append_rows(ws_sig, signals_rows)
-    if ws_log is not None:
-        # pad to 8 cols as needed
+
+    if ws_log is not None and log_rows:
+        # pad to 8 cols as needed for your exact header set
         fixed = []
         for r in log_rows:
             if len(r) < 8: r += [""] * (8 - len(r))
@@ -439,9 +431,10 @@ def main():
             fixed.append(r)
         append_rows(ws_log, fixed)
 
-    if DRY_RUN:
-        log("DRY_RUN=1 → no orders were actually placed.")
-
+    print(
+        f"🧾 Summary: SELL={sell_count} HOLD={hold_count} "
+        f"{'(dry-run, est. proceeds $' + f'{dryrun_proceeds:.2f}' + ')' if DRY_RUN else ''}"
+    )
     print("✅ stock-seller finished")
 
 if __name__ == "__main__":
