@@ -1,4 +1,4 @@
-import os, json, time, math, warnings
+import os, json, time
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -31,41 +31,23 @@ ALPACA_BASE_URL = (
     or os.getenv("APCA_API_BASE_URL")
     or "https://paper-api.alpaca.markets"
 )
-# Alpaca market data base URL
 ALPACA_DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets")
 
 DRY_RUN               = os.getenv("DRY_RUN", "1").lower() in ("1","true","yes")
-MIN_NOTIONAL_USD      = float(os.getenv("MIN_NOTIONAL_USD", "25"))
 
-# Optional: Google Sheets logging (positions are NOT read from Sheets)
+# Google Sheets logging
 USE_SHEETS_LOG        = os.getenv("USE_SHEETS_LOG", "1").lower() in ("1","true","yes")
 SHEET_NAME            = os.getenv("SHEET_NAME", "Trading Log")
-SIGNALS_TAB           = os.getenv("STOCK_SIGNALS_TAB", "stocks_sell_signals")  # kept for compatibility
-LOG_TAB               = os.getenv("STOCK_LOG_TAB", "log")  # your tab has headers: Timestamp ... Note
+LOG_TAB               = os.getenv("STOCK_LOG_TAB", "log")  # must have headers: Timestamp | Action | Symbol | NotionalUSD | Qty | OrderID | Status | Note
 
 # Verbosity (console)
 VERBOSE               = os.getenv("VERBOSE", "1").lower() in ("1","true","yes")
 
-# Exit criteria toggles
-USE_TREND_BREAK       = os.getenv("USE_TREND_BREAK", "1").lower() in ("1","true","yes")
-USE_ATR_STOP          = os.getenv("USE_ATR_STOP", "1").lower() in ("1","true","yes")
-USE_TRAILING_DROP     = os.getenv("USE_TRAILING_DROP", "1").lower() in ("1","true","yes")
-USE_MOMENTUM_FADE     = os.getenv("USE_MOMENTUM_FADE", "0").lower() in ("1","true","yes")
-USE_EARNINGS_EXIT     = os.getenv("USE_EARNINGS_EXIT", "0").lower() in ("1","true","yes")
-USE_TIME_STOP         = os.getenv("USE_TIME_STOP", "0").lower() in ("1","true","yes")
-
-# Thresholds / params
-SMA_SHORT             = int(os.getenv("SMA_SHORT", "50"))
-SMA_LONG              = int(os.getenv("SMA_LONG", "200"))
-TREND_MIN_DAYS        = int(os.getenv("TREND_MIN_DAYS", "3"))       # days below long SMA to confirm break
-ATR_WINDOW            = int(os.getenv("ATR_WINDOW", "14"))
-ATR_MULT              = float(os.getenv("ATR_MULT", "2.5"))         # EMA20 - k*ATR stop
-TRAIL_LOOKBACK_D      = int(os.getenv("TRAIL_LOOKBACK_D", "100"))
-TRAIL_DROP_PCT        = float(os.getenv("TRAIL_DROP_PCT", "12"))    # % drop from rolling high
+# Strategy params
 RSI_WINDOW            = int(os.getenv("RSI_WINDOW", "14"))
-RSI_FLOOR             = int(os.getenv("RSI_FLOOR", "40"))
-TIME_STOP_DAYS        = int(os.getenv("TIME_STOP_DAYS", "60"))
-UNDERPERF_SPY_PCT     = float(os.getenv("UNDERPERF_SPY_PCT", "8"))  # vs SPY over TIME_STOP_DAYS
+RSI_OVERBOUGHT        = int(os.getenv("RSI_OVERBOUGHT", "70"))     # RSI threshold for "overbought"
+TAKE_PROFIT_OB_PCT    = float(os.getenv("TAKE_PROFIT_OVERBOUGHT_PCT", "5"))   # profit% if RSI overbought
+TAKE_PROFIT_PCT       = float(os.getenv("TAKE_PROFIT_PCT", "10"))             # unconditional take-profit %
 
 # ========================================
 # Utility
@@ -160,21 +142,8 @@ def fetch_history(ticker: str, max_days: int = 450) -> pd.DataFrame:
         vlog_print(f"⚠️ Exception fetching {ticker} bars: {e}")
         return pd.DataFrame()
 
-def fetch_next_earnings_days(ticker: str) -> Optional[pd.Timestamp]:
-    """Stub: implement via Polygon/other if USE_EARNINGS_EXIT is enabled."""
-    return None
-
 # ========================================
 # Indicators
-def sma(s: pd.Series, w: int) -> pd.Series: return s.rolling(w).mean()
-def ema(s: pd.Series, w: int) -> pd.Series: return s.ewm(span=w, adjust=False).mean()
-
-def atr(df: pd.DataFrame, w: int) -> pd.Series:
-    h, l, c = df["High"], df["Low"], df["Close"]
-    prev_c = c.shift(1)
-    tr = pd.concat([(h-l).abs(), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
-    return tr.rolling(window=w, min_periods=w).mean()
-
 def rsi(s: pd.Series, w: int = 14) -> pd.Series:
     d = s.diff()
     up = d.clip(lower=0)
@@ -184,19 +153,16 @@ def rsi(s: pd.Series, w: int = 14) -> pd.Series:
     rs = gain / loss
     return 100 - (100/(1+rs))
 
-def macd(s: pd.Series, fast=12, slow=26, signal=9):
-    ef = ema(s, fast); es = ema(s, slow)
-    line = ef - es; sig = ema(line, signal)
-    hist = line - sig
-    return line, sig, hist
-
 # ========================================
-# Decision engine
+# Decision engine (YOUR NEW RULES)
 def decide_sell(ticker: str, qty: float, avg_cost: float, df: pd.DataFrame,
                 entry_dt: Optional[pd.Timestamp]) -> Tuple[str, List[str], float]:
     """
     Returns (decision, reasons, last_price)
-    decision: "SELL" or "HOLD"
+    New rules:
+      - SELL if RSI >= RSI_OVERBOUGHT AND profit >= TAKE_PROFIT_OB_PCT
+      - SELL if profit >= TAKE_PROFIT_PCT
+      - else HOLD
     """
     if df is None or df.empty or "Close" not in df.columns:
         return "HOLD", ["no_data"], 0.0
@@ -204,74 +170,31 @@ def decide_sell(ticker: str, qty: float, avg_cost: float, df: pd.DataFrame,
     close = df["Close"].astype(float)
     last = float(close.iloc[-1])
 
-    # indicators
-    sma_s = sma(close, SMA_SHORT)
-    sma_l = sma(close, SMA_LONG)
-    ema20 = ema(close, 20)
-    atr14 = atr(df, ATR_WINDOW)
-    rsi14 = rsi(close, RSI_WINDOW)
-    macd_line, macd_sig, macd_hist = macd(close)
+    # Compute profit %
+    if avg_cost and avg_cost > 0:
+        profit_pct = (last - avg_cost) / avg_cost * 100.0
+    else:
+        profit_pct = 0.0
 
-    reasons = []
-    votes = 0
+    rsi_series = rsi(close, RSI_WINDOW)
+    rsi_now = float(rsi_series.iloc[-1]) if not rsi_series.isna().iloc[-1] else float("nan")
 
-    # Trend break
-    if USE_TREND_BREAK and len(sma_l.dropna()) > TREND_MIN_DAYS:
-        below_long = (close < sma_l).tail(TREND_MIN_DAYS).all()
-        cross_down = (sma_s.iloc[-1] < sma_l.iloc[-1]) and (last < sma_s.iloc[-1] < sma_l.iloc[-1])
-        if below_long or cross_down:
-            votes += 1; reasons.append(f"trend_break(SMA{SMA_SHORT}/{SMA_LONG})")
+    reasons: List[str] = []
+    decision = "HOLD"
 
-    # ATR stop
-    if USE_ATR_STOP and not atr14.isna().iloc[-1]:
-        stop_lvl = float(ema20.iloc[-1]) - ATR_MULT * float(atr14.iloc[-1])
-        if last < stop_lvl:
-            votes += 1; reasons.append(f"atr_stop(EMA20-{ATR_MULT}*ATR)")
+    # Rule 1: RSI overbought AND profit >= TAKE_PROFIT_OB_PCT
+    if not np.isnan(rsi_now) and rsi_now >= RSI_OVERBOUGHT and profit_pct >= TAKE_PROFIT_OB_PCT:
+        decision = "SELL"
+        reasons.append(f"rsi_overbought_and_profit(RSI≥{RSI_OVERBOUGHT}, profit≥{TAKE_PROFIT_OB_PCT:.1f}%, now={profit_pct:.2f}%)")
 
-    # Trailing drop since entry (or last N days)
-    if USE_TRAILING_DROP:
-        if entry_dt is not None and entry_dt in df.index:
-            df_entry = df.loc[entry_dt:]
-        else:
-            df_entry = df.tail(TRAIL_LOOKBACK_D)
-        rolling_high = float(df_entry["Close"].max())
-        if rolling_high > 0:
-            drop_pct = (rolling_high - last) / rolling_high * 100.0
-            if drop_pct >= TRAIL_DROP_PCT:
-                votes += 1; reasons.append(f"trail_drop({drop_pct:.1f}%≥{TRAIL_DROP_PCT}%)")
+    # Rule 2: Profit take at TAKE_PROFIT_PCT
+    if decision != "SELL" and profit_pct >= TAKE_PROFIT_PCT:
+        decision = "SELL"
+        reasons.append(f"take_profit(profit≥{TAKE_PROFIT_PCT:.1f}%, now={profit_pct:.2f}%)")
 
-    # Momentum fade (optional)
-    if USE_MOMENTUM_FADE:
-        if rsi14.iloc[-1] < RSI_FLOOR and macd_line.iloc[-1] < macd_sig.iloc[-1]:
-            votes += 1; reasons.append(f"momentum_fade(RSI<{RSI_FLOOR}, MACD<Signal)")
-
-    # Earnings exit (optional)
-    if USE_EARNINGS_EXIT:
-        ed = fetch_next_earnings_days(ticker)
-        if ed is not None:
-            days_to = (ed.date() - datetime.utcnow().date()).days
-            if days_to <= 1:
-                votes += 1; reasons.append("pre_earnings_exit")
-
-    # Time stop (optional): stagnation + underperform SPY
-    if USE_TIME_STOP and len(close) >= TIME_STOP_DAYS + 5:
-        spy = fetch_history("SPY", max_days=TIME_STOP_DAYS + 250)
-        if not spy.empty:
-            spy_close = spy["Close"].astype(float)
-            common_close, spy_aligned = close.align(spy_close, join="inner")
-            common_close = common_close.tail(TIME_STOP_DAYS+1)
-            spy_aligned  = spy_aligned.tail(TIME_STOP_DAYS+1)
-            if len(common_close) > TIME_STOP_DAYS and len(spy_aligned) > TIME_STOP_DAYS:
-                start = float(common_close.iloc[0]); end = float(common_close.iloc[-1])
-                s_start = float(spy_aligned.iloc[0]); s_end = float(spy_aligned.iloc[-1])
-                ret = (end/start - 1.0) * 100.0 if start>0 else 0.0
-                spy_ret = (s_end/s_start - 1.0) * 100.0 if s_start>0 else 0.0
-                if ret < 0 and (spy_ret - ret) >= UNDERPERF_SPY_PCT:
-                    votes += 1; reasons.append(f"time_stop({TIME_STOP_DAYS}d underperf by {spy_ret-ret:.1f}%)")
-
-    decision = "SELL" if (votes >= 1) else "HOLD"
     if not reasons:
-        reasons = ["no_trigger"]
+        reasons = [f"hold(profit={profit_pct:.2f}%, rsi={rsi_now:.2f})"]
+
     return decision, reasons, last
 
 # ========================================
@@ -300,7 +223,7 @@ def alpaca_sell_market(ticker: str, qty: float) -> Tuple[str, str]:
     return (j.get("id",""), j.get("status","submitted"))
 
 # ========================================
-# Optional Sheets logging (signals & actions) — positions are NOT read from Sheets
+# Google Sheets logging (log tab only)
 try:
     import gspread
     def get_gc():
@@ -308,36 +231,31 @@ try:
         if not raw:
             raise RuntimeError("Missing GOOGLE_CREDS_JSON")
         return gspread.service_account_from_dict(json.loads(raw))
-    def ensure_tabs(gc):
+
+    def ensure_log_tab(gc):
         sh = None
-        try: sh = gc.open(SHEET_NAME)
+        try:
+            sh = gc.open(SHEET_NAME)
         except gspread.exceptions.SpreadsheetNotFound:
             sh = gc.create(SHEET_NAME)
 
-        def _ensure(title, headers, clear_first=False):
-            try:
-                ws = sh.worksheet(title)
-            except gspread.WorksheetNotFound:
-                ws = sh.add_worksheet(title=title, rows="2000", cols="50")
-            if clear_first:
-                ws.clear()
-            end = chr(ord('A') + len(headers) - 1) + "1"
-            vals = ws.get_values(f"A1:{end}")
-            if not vals or vals[0] != headers:
-                # Fix deprecation: pass values first, then range_name
-                ws.update([headers], f"A1:{end}")
-            try: ws.freeze(rows=1)
-            except Exception: pass
-            return ws
+        headers = ["Timestamp","Action","Symbol","NotionalUSD","Qty","OrderID","Status","Note"]
 
-        signals_headers = ["Timestamp","Ticker","Decision","Qty","Last","Notional","Reasons","Notes"]
-        # Your existing LOG tab headers (do not change order or names)
-        log_headers     = ["Timestamp","Action","Symbol","NotionalUSD","Qty","OrderID","Status","Note"]
+        try:
+            ws = sh.worksheet(LOG_TAB)
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title=LOG_TAB, rows="2000", cols="50")
 
-        # We won't clear either tab on each run
-        ws_sig = _ensure(SIGNALS_TAB, signals_headers, clear_first=False)
-        ws_log = _ensure(LOG_TAB,     log_headers,     clear_first=False)
-        return ws_sig, ws_log
+        end = chr(ord('A') + len(headers) - 1) + "1"
+        vals = ws.get_values(f"A1:{end}")
+        if not vals or vals[0] != headers:
+            # Pass values first, then range_name (avoid deprecation warning)
+            ws.update([headers], f"A1:{end}")
+        try:
+            ws.freeze(rows=1)
+        except Exception:
+            pass
+        return ws
 
     def append_rows(ws, rows: List[List[Any]]):
         if not rows: return
@@ -346,7 +264,7 @@ try:
 except Exception:
     gspread = None
     def get_gc(): raise RuntimeError("gspread not available")
-    def ensure_tabs(gc): return None, None
+    def ensure_log_tab(gc): return None
     def append_rows(ws, rows): return
 
 # ========================================
@@ -365,46 +283,41 @@ def main():
 
     print(f"📈 Found {len(positions)} long position(s) to evaluate")
 
-    # 2) Optionally set up logging tabs (signals/log). Positions are not read from Sheets.
-    ws_sig = ws_log = None
+    # 2) Optionally set up log sheet
+    ws_log = None
     if USE_SHEETS_LOG and gspread is not None:
         try:
             gc = get_gc()
-            ws_sig, ws_log = ensure_tabs(gc)
+            ws_log = ensure_log_tab(gc)
         except Exception as e:
             print(f"⚠️ Sheets logging disabled: {e}")
 
-    signals_rows: List[List[Any]] = []  # optional signals tab (kept for compatibility)
-    log_rows: List[List[Any]] = []      # will mirror console decisions into your LOG tab
+    log_rows: List[List[Any]] = []
 
     # Helper to add a row in LOG format + console message
     def vlog(action: str, symbol: str, notional: float, qty: float, order_id: str, status: str, note: str):
         ts = now_iso()
         msg = f"[{symbol}] {action} qty={qty:.4f} notional=${notional:.2f} status={status} note={note}"
         vlog_print(msg)
-        log_rows.append([
-            ts, action, symbol, f"{notional:.2f}", f"{qty:.4f}", order_id, status, note
-        ])
+        log_rows.append([ts, action, symbol, f"{notional:.2f}", f"{qty:.4f}", order_id, status, note])
 
     sell_count = 0
     hold_count = 0
     dryrun_proceeds = 0.0
 
+    # 3) Evaluate positions
     for pos in positions:
         tkr = pos["ticker"]
         qty = float(pos["qty"])
         avg = float(pos["avg_cost"])
 
-        df = fetch_history(tkr, max_days=max(450, SMA_LONG + 50))
+        df = fetch_history(tkr, max_days=450)
         decision, reasons, last = decide_sell(tkr, qty, avg, df, pos.get("entry_dt"))
 
         notional = last * qty if last > 0 else 0.0
         notes = "; ".join(reasons)
 
-        # Optional signals (separate tab; keep but don't clear the tab)
-        signals_rows.append([now_iso(), tkr, decision, f"{qty:.4f}", f"{last:.2f}", f"{notional:.2f}", ", ".join(reasons), f"avg ${avg:.2f}"])
-
-        if decision == "SELL" and notional >= MIN_NOTIONAL_USD:
+        if decision == "SELL":
             if DRY_RUN:
                 order_id, status = "DRYRUN", "dry-run"
             else:
@@ -418,10 +331,7 @@ def main():
 
         time.sleep(0.2)  # polite throttle
 
-    # 3) Write logs (optional)
-    if ws_sig is not None and signals_rows:
-        append_rows(ws_sig, signals_rows)
-
+    # 4) Write logs (optional)
     if ws_log is not None and log_rows:
         # pad to 8 cols as needed for your exact header set
         fixed = []
