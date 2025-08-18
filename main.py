@@ -5,14 +5,34 @@ from typing import List, Dict, Any, Optional, Tuple
 import requests
 import pandas as pd
 import numpy as np
-import yfinance as yf
 
 # ============= Config (env) =============
 # Broker / execution
-BROKER                = os.getenv("BROKER", "ALPACA").upper()   # "ALPACA" (supported) or ""
-ALPACA_KEY            = os.getenv("ALPACA_KEY_ID", "")
-ALPACA_SECRET         = os.getenv("ALPACA_SECRET_KEY", "")
-ALPACA_BASE_URL       = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+BROKER = os.getenv("BROKER", "ALPACA").upper()   # "ALPACA" (supported) or ""
+
+# Accept several common env var names for Alpaca keys (more deploy-proof)
+ALPACA_KEY = (
+    os.getenv("ALPACA_KEY_ID")
+    or os.getenv("APCA_API_KEY_ID")
+    or os.getenv("ALPACA_API_KEY")
+    or os.getenv("ALPACA_KEY")
+    or ""
+)
+ALPACA_SECRET = (
+    os.getenv("ALPACA_SECRET_KEY")
+    or os.getenv("APCA_API_SECRET_KEY")
+    or os.getenv("ALPACA_API_SECRET")
+    or os.getenv("ALPACA_SECRET")
+    or ""
+)
+
+ALPACA_BASE_URL = (
+    os.getenv("ALPACA_BASE_URL")
+    or os.getenv("APCA_API_BASE_URL")
+    or "https://paper-api.alpaca.markets"
+)
+# Alpaca market data base URL
+ALPACA_DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets")
 
 DRY_RUN               = os.getenv("DRY_RUN", "1").lower() in ("1","true","yes")
 MIN_NOTIONAL_USD      = float(os.getenv("MIN_NOTIONAL_USD", "25"))
@@ -74,7 +94,7 @@ def fetch_alpaca_positions() -> List[Dict[str, Any]]:
         try:
             if str(p.get("side","")).lower() != "long":
                 continue
-            if p.get("asset_class","").lower() != "us_equity":
+            if p.get("asset_class","{}").lower() not in ("us_equity", "us_equity/etp", "us_equity/adr"):
                 continue
             symbol = (p.get("symbol") or "").upper()
             qty = float(p.get("qty", "0") or 0)
@@ -86,32 +106,53 @@ def fetch_alpaca_positions() -> List[Dict[str, Any]]:
     return out
 
 # ========================================
-# Market data
-def fetch_history(ticker: str, max_days: int=450) -> pd.DataFrame:
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        df = yf.download(ticker, period="max", interval="1d", auto_adjust=False, progress=False, threads=True)
-    if df is None or df.empty:
+# Market data (Alpaca Data API)
+def fetch_history(ticker: str, max_days: int = 450) -> pd.DataFrame:
+    """
+    Fetch daily bars from Alpaca. Returns DataFrame with index=datetime and
+    columns: Open, High, Low, Close, Volume.
+    """
+    if not (ALPACA_KEY and ALPACA_SECRET):
+        raise RuntimeError("Alpaca credentials missing (ALPACA_KEY_ID / ALPACA_SECRET_KEY)")
+
+    limit = min(max_days + 20, 10000)
+
+    url = f"{ALPACA_DATA_URL}/v2/stocks/{ticker}/bars"
+    params = {
+        "timeframe": "1Day",
+        "limit": str(limit),
+        "adjustment": "raw",  # or "all" if you want splits/divs adjusted
+        # "feed": "sip",      # optional if you have SIP; omit if not
+    }
+    headers = {
+        "APCA-API-KEY-ID": ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET,
+    }
+
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=20)
+        if r.status_code >= 300:
+            return pd.DataFrame()
+        j = r.json() or {}
+        bars = j.get("bars", [])
+        if not bars:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(bars)
+        # 't' is RFC3339 timestamp
+        df["t"] = pd.to_datetime(df["t"], utc=True).dt.tz_convert(None)
+        df = df.rename(columns={
+            "t": "Date", "o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"
+        }).set_index("Date")
+        cols = ["Open", "High", "Low", "Close", "Volume"]
+        df = df[cols].sort_index().dropna().tail(max_days).copy()
+        return df
+    except Exception:
         return pd.DataFrame()
-    df = df.dropna().tail(max_days).copy()
-    df.index = pd.to_datetime(df.index).tz_localize(None)
-    return df
+
 
 def fetch_next_earnings_days(ticker: str) -> Optional[pd.Timestamp]:
-    try:
-        cal = yf.Ticker(ticker).calendar
-        if cal is not None and not cal.empty:
-            dts = []
-            for v in cal.to_dict("list").values():
-                for x in v:
-                    try:
-                        dts.append(pd.to_datetime(x).tz_localize(None))
-                    except Exception:
-                        pass
-            if dts:
-                return min(dts)
-    except Exception:
-        return None
+    """Stub: implement via Polygon/other if USE_EARNINGS_EXIT is enabled."""
     return None
 
 # ========================================
@@ -119,13 +160,15 @@ def fetch_next_earnings_days(ticker: str) -> Optional[pd.Timestamp]:
 def sma(s: pd.Series, w: int) -> pd.Series: return s.rolling(w).mean()
 def ema(s: pd.Series, w: int) -> pd.Series: return s.ewm(span=w, adjust=False).mean()
 
+
 def atr(df: pd.DataFrame, w: int) -> pd.Series:
     h, l, c = df["High"], df["Low"], df["Close"]
     prev_c = c.shift(1)
     tr = pd.concat([(h-l).abs(), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
     return tr.rolling(window=w, min_periods=w).mean()
 
-def rsi(s: pd.Series, w: int=14) -> pd.Series:
+
+def rsi(s: pd.Series, w: int = 14) -> pd.Series:
     d = s.diff()
     up = d.clip(lower=0)
     down = -d.clip(upper=0)
@@ -133,6 +176,7 @@ def rsi(s: pd.Series, w: int=14) -> pd.Series:
     loss = down.ewm(alpha=1/w, adjust=False).mean().replace(0, np.nan)
     rs = gain / loss
     return 100 - (100/(1+rs))
+
 
 def macd(s: pd.Series, fast=12, slow=26, signal=9):
     ef = ema(s, fast); es = ema(s, slow)
@@ -274,7 +318,8 @@ try:
             end = chr(ord('A') + len(headers) - 1) + "1"
             vals = ws.get_values(f"A1:{end}")
             if not vals or vals[0] != headers:
-                ws.update(f"A1:{end}", [headers])
+                # Fix deprecation: pass values first, then range_name
+                ws.update([headers], f"A1:{end}")
             try: ws.freeze(rows=1)
             except Exception: pass
             return ws
@@ -300,6 +345,7 @@ except Exception:
 # Main
 def main():
     print("🏁 stock-seller (portfolio-native) starting")
+
     # 1) Fetch live positions from broker
     if BROKER != "ALPACA":
         raise RuntimeError("Only BROKER=ALPACA is supported in this portfolio-native version right now.")
