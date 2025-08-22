@@ -1,88 +1,71 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Stock Seller — "sell only on profit & RSI" with safe rounding (Alpaca)
-
-Rules
-- SELL only if:
-    profit_pct >= PROFIT_THRESHOLD_PCT  AND  RSI >= RSI_SELL_MIN
-- If SELL criteria true and position value >= DUST_SELL_CUTOFF_USD:
-    sell one ladder step (SELL_STEP_SIZE of shares) this run
-- If SELL criteria true and position value <  DUST_SELL_CUTOFF_USD:
-    sell the entire position (no ladder)
-- Otherwise HOLD (even if position < $5)
-
-Other features
-- Fractional share rounding & clamping to avoid "insufficient qty" (403)
-- Optional Sheets logging
-- DRY_RUN by default
-
-Env
-  APCA_API_KEY_ID, APCA_API_SECRET_KEY, APCA_API_BASE_URL
-  ALPACA_DATA_URL="https://data.alpaca.markets"
-  ALPACA_DATA_FEED="iex"   # or "sip" if you have it
-
-  DRY_RUN=1
-  PROFIT_THRESHOLD_PCT=5
-  RSI_LEN=14
-  RSI_SELL_MIN=70
-  RSI_TIMEFRAME=1Day      # 1Min, 5Min, 15Min, 1Hour, 1Day
-  SELL_STEP_SIZE=0.33     # fraction of shares to sell per run when laddering
-  DUST_SELL_CUTOFF_USD=5  # if criteria are true & value < cutoff -> sell ALL
-  SELL_SHARE_DECIMALS=6   # broker fractional precision for equities
-
-  # Optional safety limit
-  MAX_POSITIONS_PER_RUN=999
-
-  # Optional Sheets logging
-  USE_SHEETS_LOG=0
-  SHEET_NAME="Trading Log"
-  STOCK_LOG_TAB="log"
-  GOOGLE_CREDS_JSON='{"type":"service_account", ... }'
-"""
 import os, json, time
-from decimal import Decimal, getcontext
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 
 import requests
+import pandas as pd
+import numpy as np
+from decimal import Decimal, getcontext
 
-# ===== Config =====
-ALPACA_KEY    = os.getenv("APCA_API_KEY_ID", "")
-ALPACA_SECRET = os.getenv("APCA_API_SECRET_KEY", "")
-ALPACA_BASE   = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
-DATA_BASE     = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets")
-DATA_FEED     = os.getenv("ALPACA_DATA_FEED", "iex")
+# ============= Config (env) =============
+BROKER = os.getenv("BROKER", "ALPACA").upper()   # "ALPACA" (supported) or ""
 
-DRY_RUN = os.getenv("DRY_RUN", "1").lower() in ("1","true","yes")
+# Accept several common env var names for Alpaca keys
+ALPACA_KEY = (
+    os.getenv("ALPACA_KEY_ID")
+    or os.getenv("APCA_API_KEY_ID")
+    or os.getenv("ALPACA_API_KEY")
+    or os.getenv("ALPACA_KEY")
+    or ""
+)
+ALPACA_SECRET = (
+    os.getenv("ALPACA_SECRET_KEY")
+    or os.getenv("APCA_API_SECRET_KEY")
+    or os.getenv("ALPACA_API_SECRET")
+    or os.getenv("ALPACA_SECRET")
+    or ""
+)
 
-PROFIT_THRESHOLD_PCT = float(os.getenv("PROFIT_THRESHOLD_PCT", "5"))
-RSI_LEN              = int(os.getenv("RSI_LEN", "14"))
-RSI_SELL_MIN         = float(os.getenv("RSI_SELL_MIN", "70"))
-RSI_TIMEFRAME        = os.getenv("RSI_TIMEFRAME", "1Day")
+ALPACA_BASE_URL = (
+    os.getenv("ALPACA_BASE_URL")
+    or os.getenv("APCA_API_BASE_URL")
+    or "https://paper-api.alpaca.markets"
+)
+ALPACA_DATA_URL   = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets")
+ALPACA_DATA_FEED  = os.getenv("ALPACA_DATA_FEED", "iex")  # "iex" for free plans; "sip" if you have it
 
-SELL_STEP_SIZE       = float(os.getenv("SELL_STEP_SIZE", "0.33"))  # 33% per run
-DUST_SELL_CUTOFF_USD = float(os.getenv("DUST_SELL_CUTOFF_USD", "5"))
-SHARE_DECIMALS       = int(os.getenv("SELL_SHARE_DECIMALS", "6"))
+DRY_RUN               = os.getenv("DRY_RUN", "1").lower() in ("1","true","yes")
 
-MAX_POS_PER_RUN      = int(os.getenv("MAX_POSITIONS_PER_RUN", "999"))
+# Google Sheets logging
+USE_SHEETS_LOG        = os.getenv("USE_SHEETS_LOG", "1").lower() in ("1","true","yes")
+SHEET_NAME            = os.getenv("SHEET_NAME", "Trading Log")
+LOG_TAB               = os.getenv("STOCK_LOG_TAB", "log")  # headers: Timestamp | Action | Symbol | NotionalUSD | Qty | OrderID | Status | Note
 
-# Sheets logging
-USE_SHEETS_LOG   = os.getenv("USE_SHEETS_LOG", "0").lower() in ("1","true","yes")
-SHEET_NAME       = os.getenv("SHEET_NAME", "Trading Log")
-STOCK_LOG_TAB    = os.getenv("STOCK_LOG_TAB", "log")
-GOOGLE_CREDS_JSON= os.getenv("GOOGLE_CREDS_JSON", "")
+# Verbosity (console)
+VERBOSE               = os.getenv("VERBOSE", "1").lower() in ("1","true","yes")
+
+# Strategy params
+RSI_WINDOW            = int(os.getenv("RSI_WINDOW", "14"))
+RSI_OVERBOUGHT        = int(os.getenv("RSI_OVERBOUGHT", "70"))       # RSI threshold for "overbought"
+TAKE_PROFIT_OB_PCT    = float(os.getenv("TAKE_PROFIT_OVERBOUGHT_PCT", "5"))   # profit% if RSI overbought
+TAKE_PROFIT_PCT       = float(os.getenv("TAKE_PROFIT_PCT", "10"))             # unconditional take-profit %
+
+# NEW: broker fraction precision for equities
+SELL_SHARE_DECIMALS   = int(os.getenv("SELL_SHARE_DECIMALS", "6"))
 
 getcontext().prec = 28
 
-# ===== Utilities =====
+# ========================================
+# Utility
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def vlog(msg: str):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+def vlog_print(msg: str):
+    if VERBOSE:
+        print(msg)
 
-def alp_headers():
+# Headers for Alpaca
+def alp_headers() -> Dict[str, str]:
     return {
         "APCA-API-KEY-ID": ALPACA_KEY,
         "APCA-API-SECRET-KEY": ALPACA_SECRET,
@@ -90,226 +73,389 @@ def alp_headers():
         "Accept": "application/json",
     }
 
-def http_get(url: str, params: Dict[str, Any]=None, timeout:int=20):
+# ========================================
+# Safe HTTP helpers with simple diagnostics
+def http_get(url: str, params: Dict[str, Any] = None, timeout: int = 20):
     r = requests.get(url, headers=alp_headers(), params=params or {}, timeout=timeout)
-    if r.status_code >= 300:
-        raise RuntimeError(f"GET {url} -> {r.status_code} {r.text}")
-    return r.json()
+    return r
 
-def http_post(url: str, data: Dict[str, Any], timeout:int=20):
+def http_post(url: str, data: Dict[str, Any], timeout: int = 20):
     r = requests.post(url, headers=alp_headers(), data=json.dumps(data), timeout=timeout)
-    if r.status_code >= 300:
-        raise RuntimeError(f"POST {url} -> {r.status_code} {r.text}")
-    return r.json()
+    return r
 
-def http_delete(url: str, timeout:int=20):
+def http_delete(url: str, timeout: int = 20):
     r = requests.delete(url, headers=alp_headers(), timeout=timeout)
-    if r.status_code >= 300:
-        raise RuntimeError(f"DELETE {url} -> {r.status_code} {r.text}")
-    return r.json() if r.text else {"status":"ok"}
+    return r
 
-# ===== Fractional rounding & clamp =====
-from decimal import Decimal as D
-def round_down_shares(qty: D, decimals:int=SHARE_DECIMALS) -> D:
-    step = D(1).scaleb(-decimals)  # 10^-decimals
-    return (qty // step) * step
+# ========================================
+# Automatic base-url fallback for 403 "forbidden" on positions
+def _other_alpaca_base(url: str) -> str:
+    if "paper-api.alpaca.markets" in url:
+        return url.replace("paper-api.alpaca.markets", "api.alpaca.markets")
+    if "api.alpaca.markets" in url:
+        return url.replace("api.alpaca.markets", "paper-api.alpaca.markets")
+    return url  # unknown; leave unchanged
 
-def clamp_sell_qty(requested_qty: D, available_qty: D, decimals:int=SHARE_DECIMALS) -> D:
-    rq = round_down_shares(requested_qty, decimals)
-    av = round_down_shares(available_qty, decimals)
-    return rq if rq <= av else av
+def _get_positions_with_fallback(base_url: str):
+    url = f"{base_url}/v2/positions"
+    r = http_get(url)
+    if r.status_code == 200:
+        return r.json(), base_url
+    # If credentials/env accidentally target the wrong plane (live vs paper), 403 is common.
+    if r.status_code == 403:
+        alt = _other_alpaca_base(base_url)
+        if alt != base_url:
+            vlog_print(f"ℹ️ positions 403 on {base_url}; retrying on {alt}")
+            r2 = http_get(f"{alt}/v2/positions")
+            if r2.status_code == 200:
+                return r2.json(), alt
+            else:
+                raise RuntimeError(f"Alpaca positions error {r2.status_code} on alt: {r2.text}")
+    # Any other non-200
+    raise RuntimeError(f"Alpaca positions error {r.status_code}: {r.text}")
 
-# ===== RSI (Wilder) =====
-def rsi_wilder(closes: List[float], length:int=14) -> float:
-    if len(closes) < length + 1:
-        return float("nan")
-    gains = 0.0
-    losses = 0.0
-    # seed
-    for i in range(1, length+1):
-        ch = closes[i] - closes[i-1]
-        gains += max(ch, 0.0)
-        losses += max(-ch, 0.0)
-    avg_gain = gains / length
-    avg_loss = losses / length
-    # roll
-    for i in range(length+1, len(closes)):
-        ch = closes[i] - closes[i-1]
-        up = max(ch, 0.0)
-        dn = max(-ch, 0.0)
-        avg_gain = (avg_gain*(length-1) + up) / length
-        avg_loss = (avg_loss*(length-1) + dn) / length
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
+# ========================================
+# Positions (Portfolio-native from Alpaca)
+def fetch_alpaca_positions() -> List[Dict[str, Any]]:
+    """
+    Returns list of long equity positions:
+    [{"ticker": "AAPL", "qty": 12.5, "avg_cost": 188.34}]
+    """
+    if not (ALPACA_KEY and ALPACA_SECRET):
+        raise RuntimeError("Alpaca credentials missing (ALPACA_KEY_ID / ALPACA_SECRET_KEY)")
 
-# ===== Broker IO =====
-def fetch_positions() -> List[Dict[str, Any]]:
-    url = f"{ALPACA_BASE}/v2/positions"
-    j = http_get(url)
+    data, used_base = _get_positions_with_fallback(ALPACA_BASE_URL)
+    if used_base != ALPACA_BASE_URL:
+        vlog_print(f"↪ Using base URL: {used_base}")
+
     out = []
-    for p in j:
+    for p in (data or []):
         try:
             if str(p.get("side","")).lower() != "long":
                 continue
-            qty = float(p["qty"])
-            if qty <= 0: continue
-            out.append({
-                "symbol": p["symbol"],
-                "qty": qty,
-                "avg_cost": float(p["avg_entry_price"]),
-                "market_value": float(p.get("market_value", 0) or 0),
-            })
+            if p.get("asset_class","").lower() not in ("us_equity", "us_equity/etp", "us_equity/adr"):
+                continue
+            symbol = (p.get("symbol") or "").upper()
+            qty = float(p.get("qty", "0") or 0)
+            avg = float(p.get("avg_entry_price", "0") or 0)
+            if symbol and qty > 0:
+                out.append({"ticker": symbol, "qty": qty, "avg_cost": avg, "entry_dt": None})
         except Exception:
-            pass
+            continue
     return out
 
-def fetch_last_price(symbol: str) -> float:
-    url = f"{DATA_BASE}/v2/stocks/{symbol}/trades/latest"
-    params = {"feed": DATA_FEED}
-    j = http_get(url, params=params)
-    return float(j["trade"]["p"])
+# ========================================
+# Market data (Alpaca Data API)
+def fetch_history(ticker: str, max_days: int = 450) -> pd.DataFrame:
+    """
+    Alpaca v2 bars with explicit feed and pagination.
+    Returns DataFrame with Date index and columns: Open, High, Low, Close, Volume.
+    """
+    if not (ALPACA_KEY and ALPACA_SECRET):
+        raise RuntimeError("Alpaca credentials missing (ALPACA_KEY_ID / ALPACA_SECRET_KEY)")
 
-def fetch_closes_for_rsi(symbol: str, limit:int=200, timeframe:str=RSI_TIMEFRAME) -> List[float]:
-    url = f"{DATA_BASE}/v2/stocks/{symbol}/bars"
-    params = {"timeframe": timeframe, "limit": limit, "feed": DATA_FEED, "adjustment":"raw"}
-    j = http_get(url, params=params)
-    bars = j.get("bars", [])
-    return [float(b["c"]) for b in bars]
+    base_url = f"{ALPACA_DATA_URL}/v2/stocks/{ticker}/bars"
 
-def close_position(symbol: str) -> Tuple[str,str]:
+    def _get_bars(feed: str) -> pd.DataFrame:
+        start_dt = (datetime.utcnow() - pd.Timedelta(days=800)).strftime("%Y-%m-%dT00:00:00Z")
+        params = {
+            "timeframe": "1Day",
+            "start": start_dt,
+            "adjustment": "raw",
+            "limit": "10000",
+            "feed": feed,
+        }
+
+        all_bars = []
+        page_token = None
+        while True:
+            if page_token:
+                params["page_token"] = page_token
+            try:
+                r = http_get(base_url, params=params)
+            except Exception as e:
+                vlog_print(f"⚠️ {ticker} {feed} request error: {e}")
+                break
+            if r.status_code >= 300:
+                vlog_print(f"⚠️ {ticker} {feed} HTTP {r.status_code}: {r.text[:120]}")
+                break
+            j = r.json() or {}
+            bars = j.get("bars", [])
+            if not bars:
+                break
+            all_bars.extend(bars)
+            page_token = j.get("next_page_token")
+            if not page_token or len(all_bars) >= max_days + 50:
+                break
+            time.sleep(0.1)
+
+        if not all_bars:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(all_bars)
+        df["t"] = pd.to_datetime(df["t"], utc=True).dt.tz_convert(None)
+        df = df.rename(columns={"t": "Date", "o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
+        df = df.set_index("Date").sort_index()
+        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+        return df.tail(max_days).copy()
+
+    df = _get_bars(ALPACA_DATA_FEED)
+    if df.empty and ALPACA_DATA_FEED != "sip":
+        vlog_print(f"ℹ️ {ticker}: retrying with SIP feed fallback")
+        df = _get_bars("sip")
+
+    if df.empty:
+        vlog_print(f"⚠️ No bars for {ticker} even after feed fallback")
+    else:
+        vlog_print(f"✅ {ticker}: {len(df)} daily bars fetched (last close ${float(df['Close'].iloc[-1]):.2f})")
+
+    return df
+
+# ========================================
+# Indicators — hardened RSI (no NaNs)
+def rsi(s: pd.Series, w: int = 14) -> pd.Series:
+    if len(s) < 2:
+        return pd.Series([50.0]*len(s), index=s.index)
+    d = s.diff()
+    up = d.clip(lower=0)
+    down = -d.clip(upper=0)
+
+    gain = up.ewm(alpha=1/w, adjust=False).mean()
+    loss = down.ewm(alpha=1/w, adjust=False).mean()
+
+    rs = pd.Series(np.divide(gain, loss.replace(0, np.nan)), index=s.index)
+    rsi_raw = 100 - (100 / (1 + rs))
+
+    rsi_filled = rsi_raw.copy()
+    rsi_filled[(loss == 0) & (gain > 0)] = 100.0
+    rsi_filled[(gain == 0) & (loss > 0)] = 0.0
+    rsi_filled = rsi_filled.fillna(50.0)
+    return rsi_filled
+
+# ========================================
+# Decision engine (YOUR RULES)
+def decide_sell(ticker: str, qty: float, avg_cost: float, df: pd.DataFrame,
+                entry_dt: Optional[pd.Timestamp]) -> Tuple[str, List[str], float]:
+    """
+    Returns (decision, reasons, last_price)
+      - SELL if RSI >= RSI_OVERBOUGHT AND profit >= TAKE_PROFIT_OB_PCT
+      - SELL if profit >= TAKE_PROFIT_PCT
+      - else HOLD
+    """
+    if df is None or df.empty or "Close" not in df.columns:
+        return "HOLD", ["no_data"], 0.0
+
+    close = df["Close"].astype(float)
+    last = float(close.iloc[-1])
+
+    if avg_cost and avg_cost > 0:
+        profit_pct = (last - avg_cost) / avg_cost * 100.0
+    else:
+        profit_pct = 0.0
+
+    rsi_series = rsi(close, RSI_WINDOW)
+    rsi_now = float(rsi_series.iloc[-1]) if len(rsi_series) else 50.0
+    if np.isnan(rsi_now):
+        rsi_now = 50.0
+
+    reasons: List[str] = []
+    decision = "HOLD"
+
+    if rsi_now >= RSI_OVERBOUGHT and profit_pct >= TAKE_PROFIT_OB_PCT:
+        decision = "SELL"
+        reasons.append(f"rsi_overbought_and_profit(RSI≥{RSI_OVERBOUGHT}, profit≥{TAKE_PROFIT_OB_PCT:.1f}%, now={profit_pct:.2f}%)")
+
+    if decision != "SELL" and profit_pct >= TAKE_PROFIT_PCT:
+        decision = "SELL"
+        reasons.append(f"take_profit(profit≥{TAKE_PROFIT_PCT:.1f}%, now={profit_pct:.2f}%)")
+
+    if not reasons:
+        reasons = [f"hold(profit={profit_pct:.2f}%, rsi={rsi_now:.2f})"]
+
+    return decision, reasons, last
+
+# ========================================
+# Fractional share safety helpers
+def round_down_shares(qty: Decimal, decimals: int = SELL_SHARE_DECIMALS) -> Decimal:
+    step = Decimal(1).scaleb(-decimals)  # 10^-decimals
+    return (qty // step) * step
+
+def clamp_to_available(requested: Decimal, available: Decimal, decimals: int = SELL_SHARE_DECIMALS) -> Decimal:
+    rq = round_down_shares(requested, decimals)
+    av = round_down_shares(available, decimals)
+    return rq if rq <= av else av
+
+# ========================================
+# Order placement (Alpaca)
+def alpaca_close_position(ticker: str) -> Tuple[str, str]:
+    """Full liquidation endpoint (best for 'sell everything')."""
+    url = f"{ALPACA_BASE_URL}/v2/positions/{ticker}"
     if DRY_RUN:
-        return "DRYRUN","dry-run"
-    url = f"{ALPACA_BASE}/v2/positions/{symbol}"
-    j = http_delete(url)
-    return j.get("id","closed"), j.get("status","closed")
+        return "DRYRUN", "dry-run"
+    r = http_delete(url)
+    if r.status_code >= 300:
+        return "", f"error {r.status_code}: {r.text}"
+    try:
+        j = r.json() if r.text else {}
+    except Exception:
+        j = {}
+    return (j.get("id","closed"), j.get("status","closed"))
 
-def sell_market(symbol: str, qty: D) -> Tuple[str,str]:
-    safe_qty = clamp_sell_qty(qty, qty)
-    if safe_qty <= D("0"):
-        return "","qty<=0"
+def alpaca_sell_market(ticker: str, qty: float) -> Tuple[str, str]:
+    """Market sell with floor rounding + one-tick retry if needed."""
+    safe_qty = clamp_to_available(Decimal(str(qty)), Decimal(str(qty)))
+    if safe_qty <= Decimal("0"):
+        return "", "qty<=0"
+    data = {
+        "symbol": ticker,
+        "qty": str(safe_qty),
+        "side": "sell",
+        "type": "market",
+        "time_in_force": "day"
+    }
     if DRY_RUN:
-        return "DRYRUN","dry-run"
-    url = f"{ALPACA_BASE}/v2/orders"
-    data = {"symbol":symbol, "qty":str(safe_qty), "side":"sell", "type":"market", "time_in_force":"day"}
-    try:
-        j = http_post(url, data)
-        return j.get("id",""), j.get("status","submitted")
-    except Exception as e:
-        msg = str(e).lower()
-        if "insufficient" in msg or "403" in msg:
-            step = D(1).scaleb(-SHARE_DECIMALS)
-            retry_qty = max(D("0"), safe_qty - step)
-            if retry_qty > 0:
-                data["qty"] = str(retry_qty)
-                j = http_post(url, data)
-                return j.get("id",""), j.get("status","submitted")
-        return "","error:"+str(e)
+        return "DRYRUN", "dry-run"
+    r = http_post(f"{ALPACA_BASE_URL}/v2/orders", data)
+    if r.status_code < 300:
+        j = r.json()
+        return (j.get("id",""), j.get("status","submitted"))
+    # Retry shaving one tick if "insufficient qty"
+    msg = (r.text or "").lower()
+    if "insufficient" in msg or "qty" in msg:
+        step = Decimal(1).scaleb(-SELL_SHARE_DECIMALS)
+        retry_qty = safe_qty - step
+        if retry_qty > 0:
+            data["qty"] = str(retry_qty)
+            r2 = http_post(f"{ALPACA_BASE_URL}/v2/orders", data)
+            if r2.status_code < 300:
+                j2 = r2.json()
+                return (j2.get("id",""), j2.get("status","submitted"))
+            return "", f"error {r2.status_code}: {r2.text}"
+    return "", f"error {r.status_code}: {r.text}"
 
-# ===== Logging (Sheets optional) =====
-def sheets_append(rows: List[List[str]]):
-    if not USE_SHEETS_LOG:
-        return
-    try:
-        import gspread
-        from google.oauth2.service_account import Credentials
-        info = json.loads(GOOGLE_CREDS_JSON)
-        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_info(info, scopes=scopes)
-        gc = gspread.authorize(creds)
-        ws = gc.open(SHEET_NAME).worksheet(STOCK_LOG_TAB)
-        ws.append_rows(rows, value_input_option="USER_ENTERED")
-    except Exception as e:
-        vlog(f"⚠️ Sheets logging failed: {e}")
+# ========================================
+# Google Sheets logging (log tab only)
+try:
+    import gspread
+    def get_gc():
+        raw = os.getenv("GOOGLE_CREDS_JSON")
+        if not raw:
+            raise RuntimeError("Missing GOOGLE_CREDS_JSON")
+        return gspread.service_account_from_dict(json.loads(raw))
 
-def make_row(action: str, symbol: str, notional: float, qty: D, order_id: str, status: str, note: str) -> List[str]:
-    return [now_iso(), action, symbol, f"{notional:.2f}", str(qty), order_id or "", status or "", note or ""]
+    def ensure_log_tab(gc):
+        sh = None
+        try:
+            sh = gc.open(SHEET_NAME)
+        except gspread.exceptions.SpreadsheetNotFound:
+            sh = gc.create(SHEET_NAME)
 
-# ===== Decision =====
-def should_sell(profit_pct: float, rsi_value: float) -> bool:
-    return (profit_pct >= PROFIT_THRESHOLD_PCT) and (rsi_value >= RSI_SELL_MIN)
+        headers = ["Timestamp","Action","Symbol","NotionalUSD","Qty","OrderID","Status","Note"]
 
+        try:
+            ws = sh.worksheet(LOG_TAB)
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title=LOG_TAB, rows="2000", cols="50")
+
+        end = chr(ord('A') + len(headers) - 1) + "1"
+        vals = ws.get_values(f"A1:{end}")
+        if not vals or vals[0] != headers:
+            ws.update([headers], f"A1:{end}")
+        try:
+            ws.freeze(rows=1)
+        except Exception:
+            pass
+        return ws
+
+    def append_rows(ws, rows: List[List[Any]]):
+        if not rows: return
+        for i in range(0, len(rows), 100):
+            ws.append_rows(rows[i:i+100], value_input_option="USER_ENTERED")
+except Exception:
+    gspread = None
+    def get_gc(): raise RuntimeError("gspread not available")
+    def ensure_log_tab(gc): return None
+    def append_rows(ws, rows): return
+
+# ========================================
+# Main
 def main():
-    print("🏁 stock-seller starting")
-    print(f"ENV DRY_RUN={DRY_RUN} PROFIT_THRESHOLD_PCT={PROFIT_THRESHOLD_PCT} RSI_SELL_MIN={RSI_SELL_MIN} "
-          f"SELL_STEP_SIZE={SELL_STEP_SIZE} DUST_SELL_CUTOFF_USD={DUST_SELL_CUTOFF_USD}")
+    print("🏁 stock-seller (portfolio-native) starting")
+    print(f"ENV: BROKER={BROKER} DRY_RUN={DRY_RUN} BASE_URL={ALPACA_BASE_URL} FEED={ALPACA_DATA_FEED}")
 
-    positions = fetch_positions()
+    if BROKER != "ALPACA":
+        raise RuntimeError("Only BROKER=ALPACA is supported in this portfolio-native version right now.")
+
+    # 1) Fetch live positions from broker (with base-url fallback)
+    positions = fetch_alpaca_positions()
     if not positions:
-        print("ℹ️ No long positions found.")
+        print("ℹ️ No long US equity positions from Alpaca. Nothing to do.")
         return
 
-    rows_for_sheet: List[List[str]] = []
-    sells = holds = 0
+    print(f"📈 Found {len(positions)} long position(s) to evaluate")
 
-    for i, pos in enumerate(positions):
-        if i >= MAX_POS_PER_RUN:
-            vlog(f"Hit MAX_POSITIONS_PER_RUN={MAX_POS_PER_RUN}; stopping.")
-            break
-
-        symbol = pos["symbol"]
-        qty    = float(pos["qty"])
-        avg    = float(pos["avg_cost"])
-
-        # Latest price
+    # 2) Optionally set up log sheet
+    ws_log = None
+    if USE_SHEETS_LOG and gspread is not None:
         try:
-            last = fetch_last_price(symbol)
+            gc = get_gc()
+            ws_log = ensure_log_tab(gc)
         except Exception as e:
-            vlog(f"⚠️ {symbol}: last price failed: {e}")
-            holds += 1
-            continue
+            print(f"⚠️ Sheets logging disabled: {e}")
 
-        # RSI
-        try:
-            closes = fetch_closes_for_rsi(symbol, limit=max(200, RSI_LEN+20))
-            rsi_val = rsi_wilder(closes, RSI_LEN)
-        except Exception as e:
-            vlog(f"⚠️ {symbol}: RSI fetch/compute failed: {e}")
-            holds += 1
-            continue
+    log_rows: List[List[Any]] = []
 
-        if not closes or last <= 0 or qty <= 0:
-            holds += 1
-            continue
+    def vlog(action: str, symbol: str, notional: float, qty: float, order_id: str, status: str, note: str):
+        ts = now_iso()
+        msg = f"[{symbol}] {action} qty={qty:.6f} notional=${notional:.2f} status={status} note={note}"
+        vlog_print(msg)
+        log_rows.append([ts, action, symbol, f"{notional:.2f}", f"{qty:.6f}", order_id, status, note])
 
-        profit_pct = (last - avg) / avg * 100.0
-        pos_value  = last * qty
+    sell_count = 0
+    hold_count = 0
+    dryrun_proceeds = 0.0
 
-        note_prefix = f"last=${last:.2f} avg=${avg:.2f} profit={profit_pct:.2f}% rsi={rsi_val:.2f} value=${pos_value:.2f}"
+    # 3) Evaluate positions
+    for pos in positions:
+        tkr = pos["ticker"]
+        qty = float(pos["qty"])
+        avg = float(pos["avg_cost"])
 
-        if should_sell(profit_pct, rsi_val):
-            # SELL criteria met
-            if pos_value < DUST_SELL_CUTOFF_USD:
-                # Small position -> sell ALL
-                order_id, status = close_position(symbol)
-                vlog(f"[{symbol}] CLOSE_ALL (dust under ${DUST_SELL_CUTOFF_USD:.2f}) | {note_prefix} -> {status}")
-                rows_for_sheet.append(make_row("SELL", symbol, pos_value, D(str(qty)), order_id, status, "dust_sell_all"))
-                sells += 1
-                continue
+        df = fetch_history(tkr, max_days=450)
+        decision, reasons, last = decide_sell(tkr, qty, avg, df, pos.get("entry_dt"))
+
+        notional = last * qty if last > 0 else 0.0
+        notes = "; ".join(reasons)
+
+        if decision == "SELL":
+            # Full exit is intended by your rules -> prefer close-position endpoint
+            if DRY_RUN:
+                order_id, status = "DRYRUN", "dry-run"
             else:
-                # Ladder step: sell a fraction of current shares
-                step_qty = D(str(qty)) * D(str(SELL_STEP_SIZE))
-                step_qty = clamp_sell_qty(step_qty, D(str(qty)))
-                if step_qty <= D("0"):
-                    vlog(f"[{symbol}] step_qty<=0 after clamp; HOLD | {note_prefix}")
-                    holds += 1
-                    continue
-                order_id, status = sell_market(symbol, step_qty)
-                notional = float(step_qty) * last
-                vlog(f"[{symbol}] SELL_PART qty={str(step_qty)} notional=${notional:.2f} | {note_prefix} -> {status}")
-                rows_for_sheet.append(make_row("SELL", symbol, notional, step_qty, order_id, status, "ladder_step"))
-                sells += 1
-                continue
+                order_id, status = alpaca_close_position(tkr)
+
+            vlog("STOCK-SELL", tkr, notional, qty, order_id, status, notes)
+            sell_count += 1
+            dryrun_proceeds += notional
         else:
-            # HOLD (criteria not met), even if value < $5
-            vlog(f"[{symbol}] HOLD | {note_prefix}")
-            holds += 1
+            vlog("STOCK-SELL-HOLD", tkr, notional, qty, "", "HOLD", notes)
+            hold_count += 1
 
-    if rows_for_sheet:
-        sheets_append(rows_for_sheet)
+        time.sleep(0.15)  # polite throttle
 
-    print(f"🧾 Summary: SELL={sells} HOLD={holds} {'(dry-run)' if DRY_RUN else ''}")
+    # 4) Write logs (optional)
+    if ws_log is not None and log_rows:
+        fixed = []
+        for r in log_rows:
+            if len(r) < 8: r += [""] * (8 - len(r))
+            elif len(r) > 8: r = r[:8]
+            fixed.append(r)
+        append_rows(ws_log, fixed)
+
+    print(
+        f"🧾 Summary: SELL={sell_count} HOLD={hold_count} "
+        f"{'(dry-run, est. proceeds $' + f'{dryrun_proceeds:.2f}' + ')' if DRY_RUN else ''}"
+    )
     print("✅ stock-seller finished")
 
 if __name__ == "__main__":
